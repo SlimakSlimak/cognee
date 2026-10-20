@@ -140,6 +140,7 @@ As of cognee 1.x the memory API is the primary surface. All functions are async.
 2. **recall()** - Query memory. Auto-routes to a search strategy unless `query_type` is passed (`auto_route=False` falls back to `HYBRID_COMPLETION`). A `session_id` reads the session cache first and falls through to the graph.
 3. **improve()** - Run the self-improvement stages over a dataset: with `session_ids`, bridge session Q&A, agent traces, distilled learnings and user preferences into the permanent graph and apply feedback weights; always, opt-in conflict review and global context indexing. Returns an `ImproveResult` with one `StageResult` per stage (see "IMPROVE: the orchestrator" below).
 4. **forget()** - Unified deletion (`data_id` / `dataset` / `dataset_id` / `everything=True`, plus `memory_only=True` to drop graph+vectors but keep raw files).
+   One session on its own: `cognee.session.delete_session(session_id)`, `DELETE /api/v1/sessions/{session_id}` or `cognee-cli sessions delete <id>` remove its Q&A turns, agent traces, session context and improve() watermarks, its Q&A vectors, and its `session_records` / `session_model_usage` rows — the caller's own sessions only. Lessons already distilled from it into a dataset are documents and stay (`forget(data_id=...)`). It raises with `CACHING=false`.
 
 #### Low level operations: add → cognify → search
 
