@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, nullcontext
 from datetime import datetime, timezone
@@ -142,8 +143,8 @@ SET n.name = node.name,
 # Existing edges are found by expanding the source nodes' outgoing edges rather
 # than by matching both endpoints and the relationship in one pattern: the
 # latter plans as a scan even with both endpoints bound.
-_EDGE_PROBE_QUERY = """
-UNWIND $ids AS node_id
+_EDGE_LOOKUP_QUERY = """
+UNWIND $source_ids AS node_id
 MATCH (from:Node {id: node_id})-[r:EDGE]->(to:Node)
 RETURN from.id, to.id, r.relationship_name, r.properties
 """
@@ -2071,31 +2072,11 @@ class LadybugAdapter(GraphDBInterface):
             return []
 
         try:
-            # Transform edges into format needed for batch query
-            edge_params = [
-                {
-                    "from_id": str(from_node),  # Ensure string type
-                    "to_id": str(to_node),  # Ensure string type
-                    "relationship_name": str(edge_label),  # Ensure string type
-                }
+            existing = await self._existing_edges(
+                (str(from_node), str(to_node), str(edge_label))
                 for from_node, to_node, edge_label in edges
-            ]
-
-            # Batch check query with direct string comparison
-            query = """
-            UNWIND $edges AS edge
-            MATCH (from:Node)-[r:EDGE]->(to:Node)
-            WHERE from.id = edge.from_id
-            AND to.id = edge.to_id
-            AND r.relationship_name = edge.relationship_name
-            RETURN from.id, to.id, r.relationship_name
-            """
-
-            results = await self.query(query, {"edges": edge_params})
-
-            # Convert results back to tuples and ensure string types
-            existing_edges = [(str(row[0]), str(row[1]), str(row[2])) for row in results]
-
+            )
+            existing_edges = list(existing)
             logger.debug(f"Found {len(existing_edges)} existing edges out of {len(edges)} checked")
             return existing_edges
 
@@ -2234,21 +2215,15 @@ class LadybugAdapter(GraphDBInterface):
                 self._bulk_write_lock,
                 self._source_ref_change_lock if folds_provenance else nullcontext(),
             ):
+                # One lookup for the whole call, ahead of the chunk loop: the
+                # same probe once per chunk read the graph once per chunk, so
+                # a big write paid for the graph as many times as it had chunks.
+                existing = await self._existing_edges(
+                    (edge["from_id"], edge["to_id"], edge["relationship_name"])
+                    for edge in edge_params
+                )
                 for start in range(0, total, _WRITE_CHUNK_SIZE):
                     chunk = edge_params[start : start + _WRITE_CHUNK_SIZE]
-                    # Expand only the OUTGOING edges of this chunk's source
-                    # nodes. Cost is the sum of their out-degrees, not the node
-                    # table — and cognee's hub nodes (EntityType) are hubs by
-                    # in-degree, which this never touches.
-                    # (from, to, relationship) -> stored properties blob, for
-                    # every outgoing edge of this chunk's source nodes.
-                    existing = {
-                        (row[0], row[1], row[2]): row[3]
-                        for row in await self.query(
-                            _EDGE_PROBE_QUERY,
-                            {"ids": sorted({edge["from_id"] for edge in chunk})},
-                        )
-                    }
                     new_edges = []
                     old_edges = []
                     for edge in chunk:
@@ -2621,6 +2596,34 @@ class LadybugAdapter(GraphDBInterface):
         await self.checkpoint()
         rows_dicts = self._rows_to_dicts(result, ["edge_object_id"])
         return {str(r["edge_object_id"]) for r in rows_dicts if r.get("edge_object_id") is not None}
+
+    async def _existing_edges(
+        self, keys: Iterable[tuple[str, str, str]]
+    ) -> dict[tuple[str, str, str], str]:
+        """(from, to, relationship) -> stored properties blob, for the keys that exist.
+
+        One statement for the whole call: it expands the outgoing edges of the
+        keys' source nodes and the keys are matched in Python. The statement
+        reads the graph once however many ids it gets (0.14s empty, 0.49s with
+        320k edges stored, at 160k nodes), so it must not be chunked: the same
+        shape once per 2,000-row chunk cost 10.8s and 18.6s there. Shapes that
+        bind both endpoints by primary key cost per key instead, 4.4s for the
+        same call, and 2.7s against 0.15s for a 20k-edge has_edges. The result
+        is every outgoing edge of the sources, so a hub source returns all of
+        its edges; cognee's hubs are hubs by in-degree (EntityType, NodeSet),
+        which this never expands.
+        """
+        wanted = set(keys)
+        if not wanted:
+            return {}
+        rows = await self.query(
+            _EDGE_LOOKUP_QUERY, {"source_ids": sorted({from_id for from_id, _, _ in wanted})}
+        )
+        return {
+            key: row[3]
+            for row in rows
+            if (key := (str(row[0]), str(row[1]), str(row[2]))) in wanted
+        }
 
     async def get_node_feedback_weights(self, node_ids: list[str]) -> dict[str, float]:
         if not node_ids:

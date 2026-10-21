@@ -102,3 +102,17 @@ async def test_single_edge_write_is_the_same_upsert(ladybug):
     edges = await _edges_stored(ladybug)
     assert len(edges) == 1
     assert '"two"' in edges[0][2]
+
+
+@pytest.mark.asyncio
+async def test_has_edges_reports_exactly_the_stored_edges(ladybug):
+    things = _things("x")
+    await ladybug.add_nodes(things)
+    await ladybug.add_edges(_edges(things, "x"))
+    a, b, c = (str(thing.id) for thing in things)
+
+    found = await ladybug.has_edges(
+        [(a, b, "knows"), (b, c, "knows"), (a, c, "likes"), (c, a, "knows")]
+    )
+
+    assert sorted(found) == sorted([(a, b, "knows"), (b, c, "knows"), (a, c, "likes")])
